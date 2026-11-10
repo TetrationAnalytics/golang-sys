@@ -12,32 +12,34 @@ to standard output.
 The prototypes are marked by lines beginning with "//sys" and read
 like func declarations if //sys is replaced by func, but:
 
-* The parameter lists must give a name for each argument. This
-  includes return parameters.
+  - The parameter lists must give a name for each argument. This
+    includes return parameters.
 
-* The parameter lists must give a type for each argument:
-  the (x, y, z int) shorthand is not allowed.
+  - The parameter lists must give a type for each argument:
+    the (x, y, z int) shorthand is not allowed.
 
-* If the return parameter is an error number, it must be named err.
+  - If the return parameter is an error number, it must be named err.
 
-* If go func name needs to be different from its winapi dll name,
-  the winapi name could be specified at the end, after "=" sign, like
-  //sys LoadLibrary(libname string) (handle uint32, err error) = LoadLibraryA
+  - If go func name needs to be different from its winapi dll name,
+    the winapi name could be specified at the end, after "=" sign, like
+    //sys LoadLibrary(libname string) (handle uint32, err error) = LoadLibraryA
 
-* Each function that returns err needs to supply a condition, that
-  return value of winapi will be tested against to detect failure.
-  This would set err to windows "last-error", otherwise it will be nil.
-  The value can be provided at end of //sys declaration, like
-  //sys LoadLibrary(libname string) (handle uint32, err error) [failretval==-1] = LoadLibraryA
-  and is [failretval==0] by default.
+  - Each function that returns err needs to supply a condition, that
+    return value of winapi will be tested against to detect failure.
+    This would set err to windows "last-error", otherwise it will be nil.
+    The value can be provided at end of //sys declaration, like
+    //sys LoadLibrary(libname string) (handle uint32, err error) [failretval==-1] = LoadLibraryA
+    and is [failretval==0] by default.
 
-* If the function name ends in a "?", then the function not existing is non-
-  fatal, and an error will be returned instead of panicking.
+  - If the function name ends in a "?", then the function not existing is non-
+    fatal, and an error will be returned instead of panicking.
 
 Usage:
+
 	mkwinsyscall [flags] [path ...]
 
 The flags are:
+
 	-output
 		Specify output file name (outputs to console if blank).
 	-trace
@@ -55,13 +57,11 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
-	"strconv"
 	"strings"
 	"text/template"
 )
@@ -80,6 +80,13 @@ var packageName string
 
 func packagename() string {
 	return packageName
+}
+
+func windowsdot() string {
+	if packageName == "windows" {
+		return ""
+	}
+	return "windows."
 }
 
 func syscalldot() string {
@@ -315,14 +322,23 @@ func (r *Rets) useLongHandleErrorCode(retvar string) string {
 
 // SetErrorCode returns source code that sets return parameters.
 func (r *Rets) SetErrorCode() string {
-	const code = `if r0 != 0 {
-		%s = %sErrno(r0)
+	const code = `if uint32(r0) != 0 {
+		%s = %sErrno(uint32(r0))
+	}`
+	const ntstatus = `if uint32(r0) != 0 {
+		ntstatus = %sNTStatus(uint32(r0))
 	}`
 	if r.Name == "" && !r.ReturnsError {
 		return ""
 	}
+	if r.Name == "" && r.FailCond == "" {
+		return r.useLongHandleErrorCode("uint32(r1)")
+	}
 	if r.Name == "" {
 		return r.useLongHandleErrorCode("r1")
+	}
+	if r.Type == "error" && r.Name == "ntstatus" {
+		return fmt.Sprintf(ntstatus, windowsdot())
 	}
 	if r.Type == "error" {
 		return fmt.Sprintf(code, r.Name, syscalldot())
@@ -332,7 +348,7 @@ func (r *Rets) SetErrorCode() string {
 	case r.Type[0] == '*':
 		s = fmt.Sprintf("%s = (%s)(unsafe.Pointer(r0))", r.Name, r.Type)
 	case r.Type == "bool":
-		s = fmt.Sprintf("%s = r0 != 0", r.Name)
+		s = fmt.Sprintf("%s = uint32(r0) != 0", r.Name)
 	default:
 		s = fmt.Sprintf("%s = %s(r0)", r.Name, r.Type)
 	}
@@ -465,15 +481,14 @@ func newFn(s string) (*Fn, error) {
 		return nil, errors.New("Could not extract dll name from \"" + f.src + "\"")
 	}
 	s = trim(s[1:])
-	a := strings.Split(s, ".")
-	switch len(a) {
-	case 1:
-		f.dllfuncname = a[0]
-	case 2:
-		f.dllname = a[0]
-		f.dllfuncname = a[1]
-	default:
-		return nil, errors.New("Could not extract dll name from \"" + f.src + "\"")
+	if i := strings.LastIndex(s, "."); i >= 0 {
+		f.dllname = s[:i]
+		f.dllfuncname = s[i+1:]
+	} else {
+		f.dllfuncname = s
+	}
+	if f.dllfuncname == "" {
+		return nil, fmt.Errorf("function name is not specified in %q", s)
 	}
 	if n := f.dllfuncname; strings.HasSuffix(n, "?") {
 		f.dllfuncname = n[:len(n)-1]
@@ -490,7 +505,23 @@ func (f *Fn) DLLName() string {
 	return f.dllname
 }
 
-// DLLName returns DLL function name for function f.
+// DLLVar returns a valid Go identifier that represents DLLName.
+func (f *Fn) DLLVar() string {
+	id := strings.Map(func(r rune) rune {
+		switch r {
+		case '.', '-':
+			return '_'
+		default:
+			return r
+		}
+	}, f.DLLName())
+	if !token.IsIdentifier(id) {
+		panic(fmt.Errorf("could not create Go identifier for DLLName %q", f.DLLName()))
+	}
+	return id
+}
+
+// DLLFuncName returns DLL function name for function f.
 func (f *Fn) DLLFuncName() string {
 	if f.dllfuncname == "" {
 		return f.Name
@@ -514,42 +545,9 @@ func (f *Fn) ParamPrintList() string {
 	return join(f.Params, func(p *Param) string { return fmt.Sprintf(`"%s=", %s, `, p.Name, p.Name) }, `", ", `)
 }
 
-// ParamCount return number of syscall parameters for function f.
-func (f *Fn) ParamCount() int {
-	n := 0
-	for _, p := range f.Params {
-		n += len(p.SyscallArgList())
-	}
-	return n
-}
-
-// SyscallParamCount determines which version of Syscall/Syscall6/Syscall9/...
-// to use. It returns parameter count for correspondent SyscallX function.
-func (f *Fn) SyscallParamCount() int {
-	n := f.ParamCount()
-	switch {
-	case n <= 3:
-		return 3
-	case n <= 6:
-		return 6
-	case n <= 9:
-		return 9
-	case n <= 12:
-		return 12
-	case n <= 15:
-		return 15
-	default:
-		panic("too many arguments to system call")
-	}
-}
-
-// Syscall determines which SyscallX function to use for function f.
-func (f *Fn) Syscall() string {
-	c := f.SyscallParamCount()
-	if c == 3 {
-		return syscalldot() + "Syscall"
-	}
-	return syscalldot() + "Syscall" + strconv.Itoa(c)
+// SyscallN returns a string representing the SyscallN function.
+func (f *Fn) SyscallN() string {
+	return syscalldot() + "SyscallN"
 }
 
 // SyscallParamList returns source code for SyscallX parameters for function f.
@@ -558,9 +556,12 @@ func (f *Fn) SyscallParamList() string {
 	for _, p := range f.Params {
 		a = append(a, p.SyscallArgList()...)
 	}
-	for len(a) < f.SyscallParamCount() {
-		a = append(a, "0")
+
+	// Check if the number exceeds the current SyscallN limit
+	if len(a) > 42 {
+		panic("too many arguments to system call")
 	}
+
 	return strings.Join(a, ", ")
 }
 
@@ -635,9 +636,17 @@ func (f *Fn) HelperName() string {
 	return "_" + f.Name
 }
 
+// DLL is a DLL's filename and a string that is valid in a Go identifier that should be used when
+// naming a variable that refers to the DLL.
+type DLL struct {
+	Name string
+	Var  string
+}
+
 // Source files and functions.
 type Source struct {
 	Funcs           []*Fn
+	DLLFuncNames    []*Fn
 	Files           []string
 	StdLibImports   []string
 	ExternalImports []string
@@ -670,21 +679,32 @@ func ParseFiles(fs []string) (*Source, error) {
 			return nil, err
 		}
 	}
+	src.DLLFuncNames = make([]*Fn, 0, len(src.Funcs))
+	uniq := make(map[string]bool, len(src.Funcs))
+	for _, fn := range src.Funcs {
+		name := fn.DLLFuncName()
+		if !uniq[name] {
+			src.DLLFuncNames = append(src.DLLFuncNames, fn)
+			uniq[name] = true
+		}
+	}
 	return src, nil
 }
 
 // DLLs return dll names for a source set src.
-func (src *Source) DLLs() []string {
+func (src *Source) DLLs() []DLL {
 	uniq := make(map[string]bool)
-	r := make([]string, 0)
+	r := make([]DLL, 0)
 	for _, f := range src.Funcs {
-		name := f.DLLName()
-		if _, found := uniq[name]; !found {
-			uniq[name] = true
-			r = append(r, name)
+		id := f.DLLVar()
+		if _, found := uniq[id]; !found {
+			uniq[id] = true
+			r = append(r, DLL{f.DLLName(), id})
 		}
 	}
-	sort.Strings(r)
+	sort.Slice(r, func(i, j int) bool {
+		return r[i].Var < r[j].Var
+	})
 	return r
 }
 
@@ -822,6 +842,22 @@ func (src *Source) Generate(w io.Writer) error {
 	return nil
 }
 
+func writeTempSourceFile(data []byte) (string, error) {
+	f, err := os.CreateTemp("", "mkwinsyscall-generated-*.go")
+	if err != nil {
+		return "", err
+	}
+	_, err = f.Write(data)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		os.Remove(f.Name()) // best effort
+		return "", err
+	}
+	return f.Name(), nil
+}
+
 func usage() {
 	fmt.Fprintf(os.Stderr, "usage: mkwinsyscall [flags] [path ...]\n")
 	flag.PrintDefaults()
@@ -848,12 +884,17 @@ func main() {
 
 	data, err := format.Source(buf.Bytes())
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("failed to format source: %v", err)
+		f, err := writeTempSourceFile(buf.Bytes())
+		if err != nil {
+			log.Fatalf("failed to write unformatted source to file: %v", err)
+		}
+		log.Fatalf("for diagnosis, wrote unformatted source to %v", f)
 	}
 	if *filename == "" {
 		_, err = os.Stdout.Write(data)
 	} else {
-		err = ioutil.WriteFile(*filename, data, 0644)
+		err = os.WriteFile(*filename, data, 0644)
 	}
 	if err != nil {
 		log.Fatal(err)
@@ -911,10 +952,10 @@ var (
 
 {{/* help functions */}}
 
-{{define "dlls"}}{{range .DLLs}}	mod{{.}} = {{newlazydll .}}
+{{define "dlls"}}{{range .DLLs}}	mod{{.Var}} = {{newlazydll .Name}}
 {{end}}{{end}}
 
-{{define "funcnames"}}{{range .Funcs}}	proc{{.DLLFuncName}} = mod{{.DLLName}}.NewProc("{{.DLLFuncName}}")
+{{define "funcnames"}}{{range .DLLFuncNames}}	proc{{.DLLFuncName}} = mod{{.DLLVar}}.NewProc("{{.DLLFuncName}}")
 {{end}}{{end}}
 
 {{define "helperbody"}}
@@ -941,7 +982,7 @@ func {{.HelperName}}({{.HelperParamList}}) {{template "results" .}}{
 
 {{define "results"}}{{if .Rets.List}}{{.Rets.List}} {{end}}{{end}}
 
-{{define "syscall"}}{{.Rets.SetReturnValuesCode}}{{.Syscall}}(proc{{.DLLFuncName}}.Addr(), {{.ParamCount}}, {{.SyscallParamList}}){{end}}
+{{define "syscall"}}{{.Rets.SetReturnValuesCode}}{{.SyscallN}}(proc{{.DLLFuncName}}.Addr(), {{.SyscallParamList}}){{end}}
 
 {{define "tmpvarsreadback"}}{{range .Params}}{{if .TmpVarReadbackCode}}
 {{.TmpVarReadbackCode}}{{end}}{{end}}{{end}}

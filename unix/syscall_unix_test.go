@@ -2,20 +2,23 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build aix darwin dragonfly freebsd linux netbsd openbsd solaris
+//go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
 
 package unix_test
 
 import (
+	"bytes"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -122,11 +125,10 @@ func TestSignalNum(t *testing.T) {
 
 func TestFcntlInt(t *testing.T) {
 	t.Parallel()
-	file, err := ioutil.TempFile("", "TestFnctlInt")
+	file, err := os.Create(filepath.Join(t.TempDir(), t.Name()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(file.Name())
 	defer file.Close()
 	f := file.Fd()
 	flags, err := unix.FcntlInt(f, unix.F_GETFD, 0)
@@ -141,12 +143,11 @@ func TestFcntlInt(t *testing.T) {
 // TestFcntlFlock tests whether the file locking structure matches
 // the calling convention of each kernel.
 func TestFcntlFlock(t *testing.T) {
-	name := filepath.Join(os.TempDir(), "TestFcntlFlock")
+	name := filepath.Join(t.TempDir(), "TestFcntlFlock")
 	fd, err := unix.Open(name, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC, 0)
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
 	}
-	defer unix.Unlink(name)
 	defer unix.Close(fd)
 	flock := unix.Flock_t{
 		Type:  unix.F_RDLCK,
@@ -165,7 +166,7 @@ func TestFcntlFlock(t *testing.T) {
 // "-test.run=^TestPassFD$" and an environment variable used to signal
 // that the test should become the child process instead.
 func TestPassFD(t *testing.T) {
-	if (runtime.GOOS == "darwin" || runtime.GOOS == "ios") && (runtime.GOARCH == "arm" || runtime.GOARCH == "arm64") {
+	if runtime.GOOS == "ios" {
 		t.Skip("cannot exec subprocess on iOS, skipping test")
 	}
 
@@ -195,24 +196,20 @@ func TestPassFD(t *testing.T) {
 		}
 	}
 
-	tempDir, err := ioutil.TempDir("", "TestPassFD")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tempDir)
-
 	fds, err := unix.Socketpair(unix.AF_LOCAL, unix.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatalf("Socketpair: %v", err)
 	}
-	defer unix.Close(fds[0])
-	defer unix.Close(fds[1])
 	writeFile := os.NewFile(uintptr(fds[0]), "child-writes")
 	readFile := os.NewFile(uintptr(fds[1]), "parent-reads")
 	defer writeFile.Close()
 	defer readFile.Close()
 
-	cmd := exec.Command(os.Args[0], "-test.run=^TestPassFD$", "--", tempDir)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(exe, "-test.run=^TestPassFD$", "--", t.TempDir())
 	cmd.Env = []string{"GO_WANT_HELPER_PROCESS=1"}
 	if lp := os.Getenv("LD_LIBRARY_PATH"); lp != "" {
 		cmd.Env = append(cmd.Env, "LD_LIBRARY_PATH="+lp)
@@ -266,7 +263,7 @@ func TestPassFD(t *testing.T) {
 	f := os.NewFile(uintptr(gotFds[0]), "fd-from-child")
 	defer f.Close()
 
-	got, err := ioutil.ReadAll(f)
+	got, err := io.ReadAll(f)
 	want := "Hello from child process!\n"
 	if string(got) != want {
 		t.Errorf("child process ReadAll: %q, %v; want %q", got, err, want)
@@ -298,9 +295,9 @@ func passFDChild() {
 	// We make it in tempDir, which our parent will clean up.
 	flag.Parse()
 	tempDir := flag.Arg(0)
-	f, err := ioutil.TempFile(tempDir, "")
+	f, err := os.Create(filepath.Join(tempDir, "file"))
 	if err != nil {
-		fmt.Printf("TempFile: %v", err)
+		fmt.Println(err)
 		return
 	}
 
@@ -320,7 +317,7 @@ func passFDChild() {
 	}
 }
 
-// TestUnixRightsRoundtrip tests that UnixRights, ParseSocketControlMessage,
+// TestUnixRightsRoundtrip tests that UnixRights, ParseSocketControlMessage, ParseOneSocketControlMessage,
 // and ParseUnixRights are able to successfully round-trip lists of file descriptors.
 func TestUnixRightsRoundtrip(t *testing.T) {
 	testCases := [...][][]int{
@@ -348,6 +345,23 @@ func TestUnixRightsRoundtrip(t *testing.T) {
 		if len(scms) != len(testCase) {
 			t.Fatalf("expected %v SocketControlMessage; got scms = %#v", len(testCase), scms)
 		}
+
+		var c int
+		for len(b) > 0 {
+			hdr, data, remainder, err := unix.ParseOneSocketControlMessage(b)
+			if err != nil {
+				t.Fatalf("ParseOneSocketControlMessage: %v", err)
+			}
+			if scms[c].Header != hdr || !bytes.Equal(scms[c].Data, data) {
+				t.Fatal("expected SocketControlMessage header and data to match")
+			}
+			b = remainder
+			c++
+		}
+		if c != len(scms) {
+			t.Fatalf("expected %d SocketControlMessages; got %d", len(scms), c)
+		}
+
 		for i, scm := range scms {
 			gotFds, err := unix.ParseUnixRights(&scm)
 			if err != nil {
@@ -440,11 +454,10 @@ func TestSetsockoptString(t *testing.T) {
 }
 
 func TestDup(t *testing.T) {
-	file, err := ioutil.TempFile("", "TestDup")
+	file, err := os.Create(filepath.Join(t.TempDir(), t.Name()))
 	if err != nil {
-		t.Fatalf("Tempfile failed: %v", err)
+		t.Fatal(err)
 	}
-	defer os.Remove(file.Name())
 	defer file.Close()
 	f := int(file.Fd())
 
@@ -488,14 +501,12 @@ func TestDup(t *testing.T) {
 }
 
 func TestPoll(t *testing.T) {
-	if runtime.GOOS == "android" ||
-		((runtime.GOOS == "darwin" || runtime.GOOS == "ios") && (runtime.GOARCH == "arm" || runtime.GOARCH == "arm64")) {
+	if runtime.GOOS == "android" || runtime.GOOS == "ios" {
 		t.Skip("mkfifo syscall is not available on android and iOS, skipping test")
 	}
 
-	defer chtmpdir(t)()
-	f, cleanup := mktmpfifo(t)
-	defer cleanup()
+	chtmpdir(t)
+	f := mktmpfifo(t)
 
 	const timeout = 100
 
@@ -508,16 +519,43 @@ func TestPoll(t *testing.T) {
 		}
 	}()
 
-	fds := []unix.PollFd{{Fd: int32(f.Fd()), Events: unix.POLLIN}}
-	n, err := unix.Poll(fds, timeout)
-	ok <- true
-	if err != nil {
-		t.Errorf("Poll: unexpected error: %v", err)
-		return
-	}
-	if n != 0 {
-		t.Errorf("Poll: wrong number of events: got %v, expected %v", n, 0)
-		return
+	for {
+		fds := []unix.PollFd{{Fd: int32(f.Fd()), Events: unix.POLLIN}}
+		n, err := unix.Poll(fds, timeout)
+		ok <- true
+		if err == unix.EINTR {
+			t.Logf("Poll interrupted")
+			continue
+		} else if err != nil {
+			t.Errorf("Poll: unexpected error: %v", err)
+			return
+		}
+		if n != 0 {
+			t.Errorf("Poll: wrong number of events: got %v, expected %v", n, 0)
+
+			// Identify which event(s) caused Poll to return.
+			// We can't trivially use a table here because Revents
+			// isn't the same type on all systems.
+			if fds[0].Revents&unix.POLLIN != 0 {
+				t.Log("found POLLIN event")
+			}
+			if fds[0].Revents&unix.POLLPRI != 0 {
+				t.Log("found POLLPRI event")
+			}
+			if fds[0].Revents&unix.POLLOUT != 0 {
+				t.Log("found POLLOUT event")
+			}
+			if fds[0].Revents&unix.POLLERR != 0 {
+				t.Log("found POLLERR event")
+			}
+			if fds[0].Revents&unix.POLLHUP != 0 {
+				t.Log("found POLLHUP event")
+			}
+			if fds[0].Revents&unix.POLLNVAL != 0 {
+				t.Log("found POLLNVAL event")
+			}
+		}
+		break
 	}
 }
 
@@ -558,10 +596,17 @@ func TestSelect(t *testing.T) {
 		break
 	}
 
-	// On some BSDs the actual timeout might also be slightly less than the requested.
-	// Add an acceptable margin to avoid flaky tests.
-	if took < dur*2/3 {
-		t.Errorf("Select: got %v timeout, expected at least %v", took, dur)
+	// On some platforms (e.g. NetBSD) the actual timeout might be arbitrarily
+	// less than requested. However, Linux in particular promises to only return
+	// early if a file descriptor becomes ready (not applicable here), or the call
+	// is interrupted by a signal handler (explicitly retried in the loop above),
+	// or the timeout expires.
+	if took < dur {
+		if runtime.GOOS == "linux" {
+			t.Errorf("Select: slept for %v, expected %v", took, dur)
+		} else {
+			t.Logf("Select: slept for %v, requested %v", took, dur)
+		}
 	}
 
 	rr, ww, err := os.Pipe()
@@ -606,19 +651,8 @@ func TestGetwd(t *testing.T) {
 	switch runtime.GOOS {
 	case "android":
 		dirs = []string{"/", "/system/bin"}
-	case "darwin", "ios":
-		switch runtime.GOARCH {
-		case "arm", "arm64":
-			d1, err := ioutil.TempDir("", "d1")
-			if err != nil {
-				t.Fatalf("TempDir: %v", err)
-			}
-			d2, err := ioutil.TempDir("", "d2")
-			if err != nil {
-				t.Fatalf("TempDir: %v", err)
-			}
-			dirs = []string{d1, d2}
-		}
+	case "ios":
+		dirs = []string{t.TempDir(), t.TempDir()}
 	}
 	oldwd := os.Getenv("PWD")
 	for _, d := range dirs {
@@ -678,7 +712,7 @@ func compareStat_t(t *testing.T, otherStat string, st1, st2 *unix.Stat_t) {
 }
 
 func TestFstatat(t *testing.T) {
-	defer chtmpdir(t)()
+	chtmpdir(t)
 
 	touch(t, "file1")
 
@@ -715,7 +749,7 @@ func TestFstatat(t *testing.T) {
 }
 
 func TestFchmodat(t *testing.T) {
-	defer chtmpdir(t)()
+	chtmpdir(t)
 
 	touch(t, "file1")
 	err := os.Symlink("file1", "symlink1")
@@ -782,8 +816,50 @@ func TestMkdev(t *testing.T) {
 	}
 }
 
+func TestPipe(t *testing.T) {
+	const s = "hello"
+	var pipes [2]int
+	err := unix.Pipe(pipes[:])
+	if err != nil {
+		t.Fatalf("pipe: %v", err)
+	}
+	r := pipes[0]
+	w := pipes[1]
+	go func() {
+		n, err := unix.Write(w, []byte(s))
+		if err != nil {
+			t.Errorf("bad write: %v", err)
+			return
+		}
+		if n != len(s) {
+			t.Errorf("bad write count: %d", n)
+			return
+		}
+		err = unix.Close(w)
+		if err != nil {
+			t.Errorf("bad close: %v", err)
+			return
+		}
+	}()
+	var buf [10 + len(s)]byte
+	n, err := unix.Read(r, buf[:])
+	if err != nil {
+		t.Fatalf("bad read: %v", err)
+	}
+	if n != len(s) {
+		t.Fatalf("bad read count: %d", n)
+	}
+	if string(buf[:n]) != s {
+		t.Fatalf("bad contents: %s", string(buf[:n]))
+	}
+	err = unix.Close(r)
+	if err != nil {
+		t.Fatalf("bad close: %v", err)
+	}
+}
+
 func TestRenameat(t *testing.T) {
-	defer chtmpdir(t)()
+	chtmpdir(t)
 
 	from, to := "renamefrom", "renameto"
 
@@ -806,7 +882,7 @@ func TestRenameat(t *testing.T) {
 }
 
 func TestUtimesNanoAt(t *testing.T) {
-	defer chtmpdir(t)()
+	chtmpdir(t)
 
 	symlink := "symlink1"
 	os.Remove(symlink)
@@ -844,8 +920,200 @@ func TestUtimesNanoAt(t *testing.T) {
 	}
 }
 
-// mktmpfifo creates a temporary FIFO and provides a cleanup function.
-func mktmpfifo(t *testing.T) (*os.File, func()) {
+func TestSend(t *testing.T) {
+	ec := make(chan error, 2)
+	ts := []byte("HELLO GOPHER")
+
+	fds, err := unix.Socketpair(unix.AF_LOCAL, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("Socketpair: %v", err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+
+	go func() {
+		data := make([]byte, len(ts))
+
+		_, _, err := unix.Recvfrom(fds[1], data, 0)
+		if err != nil {
+			ec <- err
+		}
+		if !bytes.Equal(ts, data) {
+			ec <- fmt.Errorf("data sent != data received. Received %q", data)
+		}
+		ec <- nil
+	}()
+	err = unix.Send(fds[0], ts, 0)
+	if err != nil {
+		ec <- err
+	}
+
+	select {
+	case err = <-ec:
+		if err != nil {
+			t.Fatalf("Send: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Send: nothing received after 2 seconds")
+	}
+}
+
+func TestSendmsgBuffers(t *testing.T) {
+	fds, err := unix.Socketpair(unix.AF_LOCAL, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		bufs := [][]byte{
+			make([]byte, 5),
+			nil,
+			make([]byte, 5),
+		}
+		n, oobn, recvflags, _, err := unix.RecvmsgBuffers(fds[1], bufs, nil, 0)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		if n != 10 {
+			t.Errorf("got %d bytes, want 10", n)
+		}
+		if oobn != 0 {
+			t.Errorf("got %d OOB bytes, want 0", oobn)
+		}
+		if recvflags != 0 {
+			t.Errorf("got flags %#x, want %#x", recvflags, 0)
+		}
+		want := [][]byte{
+			[]byte("01234"),
+			nil,
+			[]byte("56789"),
+		}
+		if !reflect.DeepEqual(bufs, want) {
+			t.Errorf("got data %q, want %q", bufs, want)
+		}
+	})
+
+	defer wg.Wait()
+
+	bufs := [][]byte{
+		[]byte("012"),
+		[]byte("34"),
+		nil,
+		[]byte("5678"),
+		[]byte("9"),
+	}
+	n, err := unix.SendmsgBuffers(fds[0], bufs, nil, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 10 {
+		t.Errorf("sent %d bytes, want 10", n)
+	}
+}
+
+// Issue 56384.
+func TestRecvmsgControl(t *testing.T) {
+	switch runtime.GOOS {
+	case "solaris", "illumos":
+		// Test fails on Solaris, saying
+		// "got 0 control messages, want 1".
+		// Not sure why; Solaris recvmsg man page says
+		// "For processes on the same host, recvmsg() can be
+		// used to receive a file descriptor from another
+		// process, but it cannot receive ancillary data."
+		t.Skipf("skipping on %s", runtime.GOOS)
+	}
+
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+
+	const payload = "hello"
+
+	// Start a goroutine that sends a control message followed by
+	// a payload on fds[1].
+	go func() {
+		f, err := os.Create(filepath.Join(t.TempDir(), "file"))
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer f.Close()
+
+		rc, err := f.SyscallConn()
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		var rights []byte
+		err = rc.Control(func(fd uintptr) {
+			rights = unix.UnixRights(int(fd))
+		})
+		if err != nil {
+			t.Error(err)
+			return
+		}
+
+		_, err = unix.SendmsgN(fds[1], nil, rights, nil, 0)
+		if err != nil {
+			t.Error(err)
+		}
+		if _, err := unix.Write(fds[1], []byte(payload)); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	// Read the control message sent by the goroutine.  The
+	// goroutine writes to fds[1], we read from fds[0].
+
+	cbuf := make([]byte, unix.CmsgSpace(4))
+	_, cn, _, _, err := unix.Recvmsg(fds[0], nil, cbuf, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cbuf = cbuf[:cn]
+
+	// Read the payload sent by the goroutine.
+
+	buf := make([]byte, len(payload))
+	n, err := unix.Read(fds[0], buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	buf = buf[:n]
+	if payload != string(buf) {
+		t.Errorf("read payload %q, want %q", buf, payload)
+	}
+
+	// Check the control message.
+
+	cmsgs, err := unix.ParseSocketControlMessage(cbuf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cmsgs) != 1 {
+		t.Fatalf("got %d control messages, want 1", len(cmsgs))
+	}
+	cfds, err := unix.ParseUnixRights(&cmsgs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfds) != 1 {
+		t.Fatalf("got %d fds, want 1", len(cfds))
+	}
+	defer unix.Close(cfds[0])
+}
+
+// mktmpfifo creates a temporary FIFO and sets up a cleanup function.
+func mktmpfifo(t *testing.T) *os.File {
+	t.Helper()
 	err := unix.Mkfifo("fifo", 0666)
 	if err != nil {
 		t.Fatalf("mktmpfifo: failed to create FIFO: %v", err)
@@ -854,18 +1122,20 @@ func mktmpfifo(t *testing.T) (*os.File, func()) {
 	f, err := os.OpenFile("fifo", os.O_RDWR, 0666)
 	if err != nil {
 		os.Remove("fifo")
-		t.Fatalf("mktmpfifo: failed to open FIFO: %v", err)
+		t.Fatal(err)
 	}
-
-	return f, func() {
+	t.Cleanup(func() {
 		f.Close()
 		os.Remove("fifo")
-	}
+	})
+
+	return f
 }
 
 // utilities taken from os/os_test.go
 
 func touch(t *testing.T, name string) {
+	t.Helper()
 	f, err := os.Create(name)
 	if err != nil {
 		t.Fatal(err)
@@ -876,62 +1146,19 @@ func touch(t *testing.T, name string) {
 }
 
 // chtmpdir changes the working directory to a new temporary directory and
-// provides a cleanup function. Used when PWD is read-only.
-func chtmpdir(t *testing.T) func() {
+// sets up a cleanup function. Used when PWD is read-only.
+func chtmpdir(t *testing.T) {
+	t.Helper()
 	oldwd, err := os.Getwd()
 	if err != nil {
-		t.Fatalf("chtmpdir: %v", err)
+		t.Fatal(err)
 	}
-	d, err := ioutil.TempDir("", "test")
-	if err != nil {
-		t.Fatalf("chtmpdir: %v", err)
+	if err := os.Chdir(t.TempDir()); err != nil {
+		t.Fatal(err)
 	}
-	if err := os.Chdir(d); err != nil {
-		t.Fatalf("chtmpdir: %v", err)
-	}
-	return func() {
+	t.Cleanup(func() {
 		if err := os.Chdir(oldwd); err != nil {
-			t.Fatalf("chtmpdir: %v", err)
+			t.Fatal(err)
 		}
-		os.RemoveAll(d)
-	}
-}
-
-func TestPipe(t *testing.T) {
-	const s = "hello"
-	var pipes [2]int
-	unix.Pipe(pipes[:])
-	r := pipes[0]
-	w := pipes[1]
-	go func() {
-		n, err := unix.Write(w, []byte(s))
-		if err != nil {
-			t.Errorf("bad write: %s\n", err)
-			return
-		}
-		if n != len(s) {
-			t.Errorf("bad write count: %d\n", n)
-			return
-		}
-		err = unix.Close(w)
-		if err != nil {
-			t.Errorf("bad close: %s\n", err)
-			return
-		}
-	}()
-	var buf [10 + len(s)]byte
-	n, err := unix.Read(r, buf[:])
-	if err != nil {
-		t.Fatalf("bad read: %s\n", err)
-	}
-	if n != len(s) {
-		t.Fatalf("bad read count: %d\n", n)
-	}
-	if string(buf[:n]) != s {
-		t.Fatalf("bad contents: %s\n", string(buf[:n]))
-	}
-	err = unix.Close(r)
-	if err != nil {
-		t.Fatalf("bad close: %s\n", err)
-	}
+	})
 }

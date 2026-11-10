@@ -2,28 +2,110 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build linux
+//go:build linux
 
 package unix_test
 
 import (
 	"bufio"
 	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
+
+func TestIoctlGetEthtoolDrvinfo(t *testing.T) {
+	if runtime.GOOS == "android" {
+		t.Skip("ethtool driver info is not available on android, skipping test")
+	}
+
+	s, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("failed to open socket: %v", err)
+	}
+	defer unix.Close(s)
+
+	ifis, err := net.Interfaces()
+	if err != nil {
+		t.Fatalf("failed to get network interfaces: %v", err)
+	}
+
+	// Print the interface name and associated driver information for each
+	// network interface supported by ethtool.
+	for _, ifi := range ifis {
+		drv, err := unix.IoctlGetEthtoolDrvinfo(s, ifi.Name)
+		if err != nil {
+			if err == unix.EOPNOTSUPP {
+				continue
+			}
+
+			if err == unix.EBUSY {
+				// See https://go.dev/issues/67350
+				t.Logf("%s: ethtool driver busy, possible kernel bug", ifi.Name)
+				continue
+			}
+
+			t.Fatalf("failed to get ethtool driver info for %q: %v", ifi.Name, err)
+		}
+
+		// Trim trailing NULLs.
+		t.Logf("%s: %q", ifi.Name, string(bytes.TrimRight(drv.Driver[:], "\x00")))
+	}
+}
+
+func TestIoctlGetEthtoolTsInfo(t *testing.T) {
+	if runtime.GOOS == "android" {
+		t.Skip("ethtool driver info is not available on android, skipping test")
+	}
+
+	s, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("failed to open socket: %v", err)
+	}
+	defer unix.Close(s)
+
+	ifis, err := net.Interfaces()
+	if err != nil {
+		t.Fatalf("failed to get network interfaces: %v", err)
+	}
+
+	// Print the interface name and associated PHC information for each
+	// network interface supported by ethtool.
+	for _, ifi := range ifis {
+		tsi, err := unix.IoctlGetEthtoolTsInfo(s, ifi.Name)
+		if err != nil {
+			if err == unix.EOPNOTSUPP {
+				continue
+			}
+
+			if err == unix.EBUSY {
+				// See https://go.dev/issues/67350
+				t.Logf("%s: ethtool driver busy, possible kernel bug", ifi.Name)
+				continue
+			}
+
+			t.Fatalf("failed to get ethtool PHC info for %q: %v", ifi.Name, err)
+		}
+
+		t.Logf("%s: ptp%d", ifi.Name, tsi.Phc_index)
+	}
+}
 
 func TestIoctlGetInt(t *testing.T) {
 	f, err := os.Open("/dev/random")
@@ -59,6 +141,108 @@ func TestIoctlRetInt(t *testing.T) {
 	}
 }
 
+func TestListns(t *testing.T) {
+	callListns := func(tb testing.TB, req *unix.NsIdReq, nsIDs []uint64, flags uint, context string) int {
+		tb.Helper()
+		n, err := unix.Listns(req, nsIDs, flags)
+		if err != nil {
+			if errors.Is(err, unix.ENOSYS) {
+				tb.Skip("listns syscall is not available (need Linux >= 6.19), skipping test")
+			}
+			if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+				tb.Skipf("listns requires additional privileges in this environment, skipping test: %v", err)
+			}
+			tb.Fatalf("%s: Listns failed: %v", context, err)
+		}
+		if n < 0 || n > len(nsIDs) {
+			tb.Fatalf("%s: Listns returned unexpected count %d, want [0, %d]", context, n, len(nsIDs))
+		}
+		return n
+	}
+
+	t.Run("all namespaces", func(t *testing.T) {
+		req := &unix.NsIdReq{
+			Size:       unix.NS_ID_REQ_SIZE_VER0,
+			Ns_id:      0,
+			Ns_type:    0,
+			User_ns_id: 0,
+		}
+		ids := make([]uint64, 64)
+		callListns(t, req, ids, 0, "all namespaces")
+	})
+
+	t.Run("network namespaces only", func(t *testing.T) {
+		req := &unix.NsIdReq{
+			Size:       unix.NS_ID_REQ_SIZE_VER0,
+			Ns_id:      0,
+			Ns_type:    uint32(unix.NET_NS),
+			User_ns_id: 0,
+		}
+		ids := make([]uint64, 64)
+		callListns(t, req, ids, 0, "network namespaces only")
+	})
+
+	t.Run("current user namespace owner", func(t *testing.T) {
+		req := &unix.NsIdReq{
+			Size:       unix.NS_ID_REQ_SIZE_VER0,
+			Ns_id:      0,
+			Ns_type:    0,
+			User_ns_id: unix.LISTNS_CURRENT_USER,
+		}
+		ids := make([]uint64, 64)
+		callListns(t, req, ids, 0, "current user namespace owner")
+	})
+
+	t.Run("network and mount namespaces", func(t *testing.T) {
+		req := &unix.NsIdReq{
+			Size:       unix.NS_ID_REQ_SIZE_VER0,
+			Ns_id:      0,
+			Ns_type:    uint32(unix.NET_NS | unix.MNT_NS),
+			User_ns_id: 0,
+		}
+		ids := make([]uint64, 64)
+		callListns(t, req, ids, 0, "network and mount namespaces")
+	})
+
+	t.Run("pagination via ns_id", func(t *testing.T) {
+		const pageSize = 10
+		req := &unix.NsIdReq{
+			Size:       unix.NS_ID_REQ_SIZE_VER0,
+			Ns_id:      0,
+			Ns_type:    0,
+			User_ns_id: 0,
+		}
+		ids := make([]uint64, pageSize)
+
+		total := 0
+		for {
+			n := callListns(t, req, ids, 0, "pagination")
+			if n == 0 {
+				break
+			}
+
+			// Continue from the last seen namespace ID.
+			last := ids[n-1]
+			if last == req.Ns_id {
+				t.Fatalf("pagination did not advance: last=%d", last)
+			}
+			total += n
+			req.Ns_id = last
+
+			// Partial batch means we've exhausted all results.
+			if n < pageSize {
+				break
+			}
+		}
+
+		t.Logf("total ns: %d", total)
+		if total == 0 {
+			t.Fatalf("pagination should return at least one namespace")
+		}
+	})
+
+}
+
 func TestIoctlGetRTCTime(t *testing.T) {
 	f, err := os.Open("/dev/rtc0")
 	if err != nil {
@@ -82,6 +266,12 @@ func TestIoctlGetRTCWkAlrm(t *testing.T) {
 	defer f.Close()
 
 	v, err := unix.IoctlGetRTCWkAlrm(int(f.Fd()))
+
+	// Not all RTC drivers support wakeup alarms, and will return EINVAL in such cases.
+	if err == unix.EINVAL {
+		t.Skip("RTC_WKALM_RD ioctl not supported on this rtc, skipping test")
+	}
+
 	if err != nil {
 		t.Fatalf("failed to perform ioctl: %v", err)
 	}
@@ -90,14 +280,165 @@ func TestIoctlGetRTCWkAlrm(t *testing.T) {
 		v.Enabled, v.Time.Year+1900, v.Time.Mon+1, v.Time.Mday, v.Time.Hour, v.Time.Min, v.Time.Sec)
 }
 
+func TestIoctlIfreq(t *testing.T) {
+	s, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("failed to open socket: %v", err)
+	}
+	defer unix.Close(s)
+
+	ifis, err := net.Interfaces()
+	if err != nil {
+		t.Fatalf("failed to get network interfaces: %v", err)
+	}
+
+	// Compare the network interface fetched from rtnetlink with the data from
+	// the equivalent ioctl API.
+	for _, ifi := range ifis {
+		ifr, err := unix.NewIfreq(ifi.Name)
+		if err != nil {
+			t.Fatalf("failed to create ifreq for %q: %v", ifi.Name, err)
+		}
+
+		if err := unix.IoctlIfreq(s, unix.SIOCGIFINDEX, ifr); err != nil {
+			t.Fatalf("failed to get interface index for %q: %v", ifi.Name, err)
+		}
+
+		if want, got := ifi.Index, int(ifr.Uint32()); want != got {
+			t.Fatalf("unexpected interface index for %q: got: %d, want: %d",
+				ifi.Name, got, want)
+		}
+
+		if want, got := ifi.Name, ifr.Name(); want != got {
+			t.Fatalf("unexpected interface name for index %d: got: %q, want: %q",
+				ifi.Index, got, want)
+		}
+
+		wantIP, ok := firstIPv4(t, &ifi)
+		if err := unix.IoctlIfreq(s, unix.SIOCGIFADDR, ifr); err != nil {
+			// Interface may have no assigned IPv4 address.
+			if err != unix.EADDRNOTAVAIL {
+				t.Fatalf("failed to get IPv4 address for %q: %v", ifi.Name, err)
+			}
+
+			// But if we found an address via rtnetlink, we should expect the
+			// ioctl to return one.
+			if ok {
+				t.Fatalf("found IPv4 address %q for %q but ioctl returned none", wantIP, ifi.Name)
+			}
+
+			continue
+		}
+
+		// Found an address, compare it directly.
+		addr, err := ifr.Inet4Addr()
+		if err != nil {
+			t.Fatalf("failed to get ifreq IPv4 address: %v", err)
+		}
+
+		if want, got := wantIP, addr; !want.Equal(got) {
+			t.Fatalf("unexpected first IPv4 address for %q: got: %q, want: %q",
+				ifi.Name, got, want)
+		}
+	}
+}
+
+// firstIPv4 reports whether the interface has an IPv4 address assigned,
+// returning the first discovered address.
+func firstIPv4(t *testing.T, ifi *net.Interface) (net.IP, bool) {
+	t.Helper()
+
+	addrs, err := ifi.Addrs()
+	if err != nil {
+		t.Fatalf("failed to get interface %q addresses: %v", ifi.Name, err)
+	}
+
+	for _, a := range addrs {
+		// Only want valid IPv4 addresses.
+		ipn, ok := a.(*net.IPNet)
+		if !ok || ipn.IP.To4() == nil {
+			continue
+		}
+
+		return ipn.IP, true
+	}
+
+	return nil, false
+}
+
+func TestPidfd(t *testing.T) {
+	// Start a child process which will sleep for 1 hour; longer than the 10
+	// minute default Go test timeout.
+	cmd := exec.Command("sleep", "1h")
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to exec sleep: %v", err)
+	}
+
+	fd, err := unix.PidfdOpen(cmd.Process.Pid, 0)
+	if err != nil {
+		// GOARCH arm/arm64 and GOOS android builders do not support pidfds.
+		if errors.Is(err, unix.ENOSYS) {
+			t.Skipf("skipping, pidfd_open is not implemented: %v", err)
+		}
+
+		t.Fatalf("failed to open child pidfd: %v", err)
+	}
+	defer unix.Close(fd)
+
+	info := unix.PidfdInfo{
+		Mask: unix.PIDFD_INFO_PID,
+	}
+	if err := unix.IoctlPidfdInfo(fd, &info); err != nil {
+		if err != unix.ENOSYS && err != unix.ENOTTY && err != unix.EINVAL {
+			t.Errorf("PIDFD_INFO_PID ioctl failed: %v", err)
+		}
+	} else {
+		if int(info.Pid) != cmd.Process.Pid {
+			t.Errorf("got pid %d, want %d", info.Pid, cmd.Process.Pid)
+		}
+	}
+
+	// Child is running but not terminated.
+	if err := unix.Waitid(unix.P_PIDFD, fd, nil, unix.WEXITED|unix.WNOHANG, nil); err != nil {
+		if errors.Is(err, unix.EINVAL) {
+			t.Skip("skipping due to waitid EINVAL, see https://go.dev/issues/52014")
+		}
+
+		t.Fatalf("failed to check for child exit: %v", err)
+	}
+
+	const want = unix.SIGHUP
+	if err := unix.PidfdSendSignal(fd, want, nil, 0); err != nil {
+		t.Fatalf("failed to signal child process: %v", err)
+	}
+
+	// Now verify that the child process received the expected signal.
+	var eerr *exec.ExitError
+	if err := cmd.Wait(); !errors.As(err, &eerr) {
+		t.Fatalf("child process terminated but did not return an exit error: %v", err)
+	}
+
+	if err := unix.Waitid(unix.P_PIDFD, fd, nil, unix.WEXITED, nil); !errors.Is(err, unix.ECHILD) {
+		t.Fatalf("expected ECHILD for final waitid, but got: %v", err)
+	}
+
+	ws, ok := eerr.Sys().(syscall.WaitStatus)
+	if !ok {
+		t.Fatalf("expected syscall.WaitStatus value, but got: %#T", eerr.Sys())
+	}
+
+	if got := ws.Signal(); got != want {
+		t.Fatalf("unexpected child exit signal, got: %s, want: %s", got, want)
+	}
+}
+
 func TestPpoll(t *testing.T) {
 	if runtime.GOOS == "android" {
 		t.Skip("mkfifo syscall is not available on android, skipping test")
 	}
 
-	defer chtmpdir(t)()
-	f, cleanup := mktmpfifo(t)
-	defer cleanup()
+	chtmpdir(t)
+	f := mktmpfifo(t)
 
 	const timeout = 100 * time.Millisecond
 
@@ -112,15 +453,21 @@ func TestPpoll(t *testing.T) {
 
 	fds := []unix.PollFd{{Fd: int32(f.Fd()), Events: unix.POLLIN}}
 	timeoutTs := unix.NsecToTimespec(int64(timeout))
-	n, err := unix.Ppoll(fds, &timeoutTs, nil)
-	ok <- true
-	if err != nil {
-		t.Errorf("Ppoll: unexpected error: %v", err)
-		return
-	}
-	if n != 0 {
-		t.Errorf("Ppoll: wrong number of events: got %v, expected %v", n, 0)
-		return
+	for {
+		n, err := unix.Ppoll(fds, &timeoutTs, nil)
+		ok <- true
+		if err == unix.EINTR {
+			t.Log("Ppoll interrupted")
+			continue
+		} else if err != nil {
+			t.Errorf("Ppoll: unexpected error: %v", err)
+			return
+		}
+		if n != 0 {
+			t.Errorf("Ppoll: wrong number of events: got %v, expected %v", n, 0)
+			return
+		}
+		break
 	}
 }
 
@@ -136,7 +483,7 @@ func TestTime(t *testing.T) {
 
 	var now time.Time
 
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		ut, err = unix.Time(nil)
 		if err != nil {
 			t.Fatalf("Time: %v", err)
@@ -153,7 +500,7 @@ func TestTime(t *testing.T) {
 }
 
 func TestUtime(t *testing.T) {
-	defer chtmpdir(t)()
+	chtmpdir(t)
 
 	touch(t, "file1")
 
@@ -262,8 +609,31 @@ func TestPselect(t *testing.T) {
 	}
 }
 
+func TestPselectWithSigmask(t *testing.T) {
+	var sigmask unix.Sigset_t
+	sigmask.Val[0] |= 1 << (uint(unix.SIGUSR1) - 1)
+	for {
+		n, err := unix.Pselect(0, nil, nil, nil, &unix.Timespec{Sec: 0, Nsec: 0}, &sigmask)
+		if err == unix.EINTR {
+			t.Logf("Pselect interrupted")
+			continue
+		} else if err != nil {
+			t.Fatalf("Pselect: %v", err)
+		}
+		if n != 0 {
+			t.Fatalf("Pselect: got %v ready file descriptors, expected 0", n)
+		}
+		break
+	}
+}
+
 func TestSchedSetaffinity(t *testing.T) {
+	const maxcpus = 1024 // _CPU_SETSIZE
 	var newMask unix.CPUSet
+	newMask.Fill()
+	if count := newMask.Count(); count != maxcpus {
+		t.Errorf("Fill: got %d CPUs, want %d", count, maxcpus)
+	}
 	newMask.Zero()
 	if newMask.Count() != 0 {
 		t.Errorf("CpuZero: didn't zero CPU set: %v", newMask)
@@ -306,7 +676,7 @@ func TestSchedSetaffinity(t *testing.T) {
 	cpu = 1
 	if !oldMask.IsSet(cpu) {
 		newMask.Zero()
-		for i := 0; i < len(oldMask); i++ {
+		for i := range len(oldMask) {
 			if oldMask.IsSet(i) {
 				newMask.Set(i)
 				break
@@ -316,6 +686,14 @@ func TestSchedSetaffinity(t *testing.T) {
 			t.Skip("skipping setaffinity tests if CPU not available")
 		}
 	}
+
+	t.Cleanup(func() {
+		// Restore old mask so it doesn't affect successive tests.
+		err = unix.SchedSetaffinity(0, &oldMask)
+		if err != nil {
+			t.Fatalf("SchedSetaffinity: %v", err)
+		}
+	})
 
 	err = unix.SchedSetaffinity(0, &newMask)
 	if err != nil {
@@ -331,11 +709,160 @@ func TestSchedSetaffinity(t *testing.T) {
 	if gotMask != newMask {
 		t.Errorf("SchedSetaffinity: returned affinity mask does not match set affinity mask")
 	}
+}
 
-	// Restore old mask so it doesn't affect successive tests
-	err = unix.SchedSetaffinity(0, &oldMask)
+func TestSchedSetaffinityDynamic(t *testing.T) {
+	const maxcpus = 4096
+
+	newMask := unix.NewCPUSet(maxcpus)
+	newMask.Fill()
+	if count := newMask.Count(); count != maxcpus {
+		t.Errorf("Fill: got %d CPUs, want %d", count, maxcpus)
+	}
+	newMask.Zero()
+	if newMask.Count() != 0 {
+		t.Errorf("Zero: didn't zero CPU set: %v", newMask)
+	}
+	cpu := 1
+	newMask.Set(cpu)
+	if newMask.Count() != 1 || !newMask.IsSet(cpu) {
+		t.Errorf("Set: didn't set CPU %d in set: %v", cpu, newMask)
+	}
+	cpu = 5
+	newMask.Set(cpu)
+	if newMask.Count() != 2 || !newMask.IsSet(cpu) {
+		t.Errorf("Set: didn't set CPU %d in set: %v", cpu, newMask)
+	}
+	newMask.Clear(cpu)
+	if newMask.Count() != 1 || newMask.IsSet(cpu) {
+		t.Errorf("Clear: didn't clear CPU %d in set: %v", cpu, newMask)
+	}
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	oldMask := unix.NewCPUSet(maxcpus)
+	err := unix.SchedGetaffinityDynamic(0, oldMask)
 	if err != nil {
-		t.Fatalf("SchedSetaffinity: %v", err)
+		t.Fatalf("SchedGetaffinityDynamic: %v", err)
+	}
+
+	if runtime.NumCPU() < 2 {
+		t.Skip("skipping setaffinity tests on single CPU system")
+	}
+	if runtime.GOOS == "android" {
+		t.Skip("skipping setaffinity tests on android")
+	}
+
+	// On a system like ppc64x where some cores can be disabled using ppc64_cpu,
+	// setaffinity should only be called with enabled cores. The valid cores
+	// are found from the oldMask, but if none are found then the setaffinity
+	// tests are skipped. Issue #27875.
+	cpu = 1
+	if !oldMask.IsSet(cpu) {
+		newMask.Zero()
+		for i := range len(oldMask) {
+			if oldMask.IsSet(i) {
+				newMask.Set(i)
+				break
+			}
+		}
+		if newMask.Count() == 0 {
+			t.Skip("skipping setaffinity tests if CPU not available")
+		}
+	}
+
+	t.Cleanup(func() {
+		// Restore old mask so it doesn't affect successive tests.
+		err = unix.SchedSetaffinityDynamic(0, oldMask)
+		if err != nil {
+			t.Fatalf("SchedSetaffinityDynamic: %v", err)
+		}
+	})
+
+	err = unix.SchedSetaffinityDynamic(0, newMask)
+	if err != nil {
+		t.Fatalf("SchedSetaffinityDynamic: %v", err)
+	}
+
+	gotMask := unix.NewCPUSet(maxcpus)
+	err = unix.SchedGetaffinityDynamic(0, gotMask)
+	if err != nil {
+		t.Fatalf("SchedGetaffinityDynamic: %v", err)
+	}
+
+	if !slices.Equal(gotMask, newMask) {
+		t.Errorf("SchedSetaffinityDynamic: returned affinity mask does not match set affinity mask (%+v != %+v", gotMask, newMask)
+	}
+}
+
+func TestSetMemPolicy(t *testing.T) {
+	const maxnodes = 1024
+
+	getMemPolicy := func(mask unix.CPUSetDynamic, flags uintptr) (int, error) {
+		var mode int32
+		bits := uintptr(len(mask)) * unsafe.Sizeof(mask[0]) * 8
+		_, _, e := unix.Syscall6(unix.SYS_GET_MEMPOLICY, uintptr(unsafe.Pointer(&mode)), uintptr(unsafe.Pointer(&mask[0])), bits, 0, flags, 0)
+		if e != 0 {
+			return 0, e
+		}
+		return int(mode), nil
+	}
+
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	allowed := unix.NewCPUSet(maxnodes)
+	if _, err := getMemPolicy(allowed, unix.MPOL_F_MEMS_ALLOWED); err != nil {
+		t.Skipf("get_mempolicy: %v", err)
+	}
+	// Use the highest allowed node to check that the whole mask is passed.
+	node := -1
+	for i := range maxnodes {
+		if allowed.IsSet(i) {
+			node = i
+		}
+	}
+	if node == -1 {
+		t.Skip("no allowed NUMA nodes")
+	}
+	t.Logf("using NUMA node %d", node)
+
+	// Memory policy is per-thread, so no subtests here.
+	defer func() {
+		if err := unix.SetMemPolicy(unix.MPOL_DEFAULT, nil); err != nil {
+			t.Fatalf("SetMemPolicy(MPOL_DEFAULT): %v", err)
+		}
+	}()
+
+	check := func(name string) {
+		got := unix.NewCPUSet(maxnodes)
+		mode, err := getMemPolicy(got, 0)
+		if err != nil {
+			t.Fatalf("%s: get_mempolicy: %v", name, err)
+		}
+		if mode != unix.MPOL_BIND {
+			t.Errorf("%s: got mode %d, want %d (MPOL_BIND)", name, mode, unix.MPOL_BIND)
+		}
+		if got.Count() != 1 || !got.IsSet(node) {
+			t.Errorf("%s: got node mask %v, want only node %d set", name, got, node)
+		}
+	}
+
+	var mask unix.CPUSet
+	mask.Set(node)
+	if err := unix.SetMemPolicy(unix.MPOL_BIND, &mask); err != nil {
+		t.Errorf("SetMemPolicy: %v", err)
+	} else {
+		check("SetMemPolicy")
+	}
+
+	maskDyn := unix.NewCPUSet(node + 1)
+	maskDyn.Set(node)
+	if err := unix.SetMemPolicyDynamic(unix.MPOL_BIND, maskDyn); err != nil {
+		t.Errorf("SetMemPolicyDynamic: %v", err)
+	} else {
+		check("SetMemPolicyDynamic")
 	}
 }
 
@@ -348,7 +875,7 @@ func TestStatx(t *testing.T) {
 		t.Fatalf("Statx: %v", err)
 	}
 
-	defer chtmpdir(t)()
+	chtmpdir(t)
 	touch(t, "file1")
 
 	var st unix.Stat_t
@@ -436,7 +963,7 @@ func stringsFromByteSlice(buf []byte) []string {
 }
 
 func TestFaccessat(t *testing.T) {
-	defer chtmpdir(t)()
+	chtmpdir(t)
 	touch(t, "file1")
 
 	err := unix.Faccessat(unix.AT_FDCWD, "file1", unix.R_OK, 0)
@@ -488,11 +1015,10 @@ func TestFaccessat(t *testing.T) {
 }
 
 func TestSyncFileRange(t *testing.T) {
-	file, err := ioutil.TempFile("", "TestSyncFileRange")
+	file, err := os.Create(filepath.Join(t.TempDir(), t.Name()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.Remove(file.Name())
 	defer file.Close()
 
 	err = unix.SyncFileRange(int(file.Fd()), 0, 0, 0)
@@ -544,8 +1070,22 @@ func TestClockNanosleep(t *testing.T) {
 			continue
 		} else if err != nil {
 			t.Errorf("ClockNanosleep(CLOCK_REALTIME, TIMER_ABSTIME, %#v (=%v), nil) = %v", &abs, until, err)
-		} else if slept := time.Since(start); slept < delay {
-			t.Errorf("ClockNanosleep(CLOCK_REALTIME, TIMER_ABSTIME, %#v (=%v), nil) slept only %v", &abs, until, slept)
+		} else {
+			// We asked for CLOCK_REALTIME, but we have no way to know whether it
+			// jumped backward after ClockNanosleep returned. Compare both ways,
+			// and only fail if both the monotonic and wall clocks agree that
+			// the elapsed sleep was too short.
+			//
+			// This can still theoretically fail spuriously: if the clock jumps
+			// forward during ClockNanosleep and then backward again before we can
+			// call time.Now, then we could end up with a time that is too short on
+			// both the monotonic scale (because of the forward jump) and the
+			// real-time scale (because of the backward jump. However, it seems
+			// unlikely that two such contrary jumps will ever occur in the time it
+			// takes to execute this test.
+			if now := time.Now(); now.Before(until) && now.Round(0).Before(until) {
+				t.Errorf("ClockNanosleep(CLOCK_REALTIME, TIMER_ABSTIME, %#v (=%v), nil) slept only until %v", &abs, until, now)
+			}
 		}
 		break
 	}
@@ -593,11 +1133,11 @@ func TestOpenByHandleAt(t *testing.T) {
 			if err != nil {
 				t.Fatalf("OpenByHandleAt: %v", err)
 			}
-			defer unix.Close(fd)
-
 			t.Logf("opened fd %v", fd)
 			f := os.NewFile(uintptr(fd), "")
-			slurp, err := ioutil.ReadAll(f)
+			defer f.Close()
+
+			slurp, err := io.ReadAll(f)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -616,7 +1156,7 @@ func openMountByID(mountID int) (f *os.File, err error) {
 	}
 	defer mi.Close()
 	bs := bufio.NewScanner(mi)
-	wantPrefix := []byte(fmt.Sprintf("%v ", mountID))
+	wantPrefix := fmt.Appendf(nil, "%v ", mountID)
 	for bs.Scan() {
 		if !bytes.HasPrefix(bs.Bytes(), wantPrefix) {
 			continue
@@ -674,16 +1214,48 @@ func TestEpoll(t *testing.T) {
 }
 
 func TestPrctlRetInt(t *testing.T) {
-	err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
-	if err != nil {
-		t.Skipf("Prctl: %v, skipping test", err)
+	skipc := make(chan bool, 1)
+	skip := func() {
+		skipc <- true
+		runtime.Goexit()
 	}
-	v, err := unix.PrctlRetInt(unix.PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0)
-	if err != nil {
-		t.Fatalf("failed to perform prctl: %v", err)
+
+	go func() {
+		// This test uses prctl to modify the calling thread, so run it on its own
+		// throwaway thread and do not unlock it when the goroutine exits.
+		runtime.LockOSThread()
+		defer close(skipc)
+
+		err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
+		if err != nil {
+			t.Logf("Prctl: %v, skipping test", err)
+			skip()
+		}
+
+		v, err := unix.PrctlRetInt(unix.PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0)
+		if err != nil {
+			t.Errorf("failed to perform prctl: %v", err)
+		}
+		if v != 1 {
+			t.Errorf("unexpected return from prctl; got %v, expected %v", v, 1)
+		}
+	}()
+
+	if <-skipc {
+		t.SkipNow()
 	}
-	if v != 1 {
-		t.Fatalf("unexpected return from prctl; got %v, expected %v", v, 1)
+}
+
+func TestPrctlArg5Ptr(t *testing.T) {
+	var cookie uint64
+	err := unix.PrctlArg5Ptr(unix.PR_SCHED_CORE, unix.PR_SCHED_CORE_GET, 0, unix.PR_SCHED_CORE_SCOPE_THREAD, unsafe.Pointer(&cookie))
+	if err != nil {
+		if err == unix.ENOSYS || err == unix.EINVAL || err == unix.ENODEV {
+			t.Skip("PR_SCHED_CORE/PR_SCHED_CORE_GET not available")
+		}
+		t.Errorf("PR_SCHED_CORE/PR_SCHED_CORE_GET failed: %v", err)
+	} else {
+		t.Logf("CPU scheduling cookie %#x", cookie)
 	}
 }
 
@@ -753,13 +1325,7 @@ func TestOpenat2(t *testing.T) {
 	}
 
 	// prepare
-	tempDir, err := ioutil.TempDir("", t.Name())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	subdir := filepath.Join(tempDir, "dir")
+	subdir := filepath.Join(t.TempDir(), "dir")
 	if err := os.Mkdir(subdir, 0755); err != nil {
 		t.Fatal(err)
 	}
@@ -793,5 +1359,206 @@ func TestOpenat2(t *testing.T) {
 	}
 	if err != unix.EXDEV {
 		t.Errorf("Openat2 should fail with EXDEV, got %v", err)
+	}
+}
+
+func TestIoctlFileDedupeRange(t *testing.T) {
+	dir := t.TempDir()
+	f1, err := os.Create(filepath.Join(dir, "f1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f1.Close()
+
+	// Test deduplication with two blocks of zeros
+	data := make([]byte, 4096)
+
+	for range 2 {
+		_, err = f1.Write(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	f2, err := os.Create(filepath.Join(dir, "f2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f2.Close()
+
+	for i := range 2 {
+		// Make the 2nd block different
+		if i == 1 {
+			data[1] = 1
+		}
+
+		_, err = f2.Write(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dedupe := unix.FileDedupeRange{
+		Src_offset: uint64(0),
+		Src_length: uint64(4096),
+		Info: []unix.FileDedupeRangeInfo{
+			unix.FileDedupeRangeInfo{
+				Dest_fd:     int64(f2.Fd()),
+				Dest_offset: uint64(0),
+			},
+			unix.FileDedupeRangeInfo{
+				Dest_fd:     int64(f2.Fd()),
+				Dest_offset: uint64(4096),
+			},
+		}}
+
+	err = unix.IoctlFileDedupeRange(int(f1.Fd()), &dedupe)
+	if err == unix.EOPNOTSUPP || err == unix.EINVAL || err == unix.ENOTTY {
+		t.Skip("deduplication not supported on this filesystem")
+	} else if err != nil {
+		t.Fatal(err)
+	}
+
+	// The first Info should be equal
+	if dedupe.Info[0].Status < 0 {
+		errno := unix.Errno(-dedupe.Info[0].Status)
+		if errno == unix.EINVAL || errno == unix.EOPNOTSUPP {
+			t.Skip("deduplication not supported on this filesystem")
+		}
+		t.Errorf("Unexpected error in FileDedupeRange: %s", unix.ErrnoName(errno))
+	} else if dedupe.Info[0].Status == unix.FILE_DEDUPE_RANGE_DIFFERS {
+		t.Errorf("Unexpected different bytes in FileDedupeRange")
+	}
+	if dedupe.Info[0].Bytes_deduped != 4096 {
+		t.Errorf("Unexpected amount of bytes deduped %v != %v",
+			dedupe.Info[0].Bytes_deduped, 4096)
+	}
+
+	// The second Info should be different
+	if dedupe.Info[1].Status < 0 {
+		errno := unix.Errno(-dedupe.Info[1].Status)
+		if errno == unix.EINVAL || errno == unix.EOPNOTSUPP {
+			t.Skip("deduplication not supported on this filesystem")
+		}
+		t.Errorf("Unexpected error in FileDedupeRange: %s", unix.ErrnoName(errno))
+	} else if dedupe.Info[1].Status == unix.FILE_DEDUPE_RANGE_SAME {
+		t.Errorf("Unexpected equal bytes in FileDedupeRange")
+	}
+	if dedupe.Info[1].Bytes_deduped != 0 {
+		t.Errorf("Unexpected amount of bytes deduped %v != %v",
+			dedupe.Info[1].Bytes_deduped, 0)
+	}
+}
+
+// TestPwritevOffsets tests golang.org/issues/57291 where
+// offs2lohi was shifting by the size of long in bytes, not bits.
+func TestPwritevOffsets(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "x.txt")
+
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+
+	const (
+		off = 20
+	)
+	b := [][]byte{{byte(0)}}
+	n, err := unix.Pwritev(int(f.Fd()), b, off)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(b) {
+		t.Fatalf("expected to write %d, wrote %d", len(b), n)
+	}
+
+	info, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := off + int64(len(b))
+	if info.Size() != want {
+		t.Fatalf("expected size to be %d, got %d", want, info.Size())
+	}
+}
+
+func TestReadvAllocate(t *testing.T) {
+	f, err := os.Create(filepath.Join(t.TempDir(), "test"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+
+	test := func(name string, fn func(fd int)) {
+		n := int(testing.AllocsPerRun(100, func() {
+			fn(int(f.Fd()))
+		}))
+		if n != 0 {
+			t.Errorf("%q got %d allocations, want 0", name, n)
+		}
+	}
+
+	iovs := make([][]byte, 8)
+	for i := range iovs {
+		iovs[i] = []byte{'A'}
+	}
+
+	test("Writev", func(fd int) {
+		unix.Writev(fd, iovs)
+	})
+	test("Pwritev", func(fd int) {
+		unix.Pwritev(fd, iovs, 0)
+	})
+	test("Pwritev2", func(fd int) {
+		unix.Pwritev2(fd, iovs, 0, 0)
+	})
+	test("Readv", func(fd int) {
+		unix.Readv(fd, iovs)
+	})
+	test("Preadv", func(fd int) {
+		unix.Preadv(fd, iovs, 0)
+	})
+	test("Preadv2", func(fd int) {
+		unix.Preadv2(fd, iovs, 0, 0)
+	})
+}
+
+func TestSockaddrALG(t *testing.T) {
+	// Open a socket to perform SHA1 hashing.
+	fd, err := unix.Socket(unix.AF_ALG, unix.SOCK_SEQPACKET, 0)
+	if err != nil {
+		t.Skip("socket(AF_ALG):", err)
+	}
+	defer unix.Close(fd)
+	addr := &unix.SockaddrALG{Type: "hash", Name: "sha1"}
+	if err := unix.Bind(fd, addr); err != nil {
+		t.Fatal("bind:", err)
+	}
+	// Need to call accept(2) with the second and third arguments as 0,
+	// which is not possible via unix.Accept, thus the use of unix.Syscall.
+	hashfd, _, errno := unix.Syscall6(unix.SYS_ACCEPT4, uintptr(fd), 0, 0, 0, 0, 0)
+	if errno != 0 {
+		t.Fatal("accept:", errno)
+	}
+
+	hash := os.NewFile(hashfd, "sha1")
+	defer hash.Close()
+
+	// Hash an input string and read the results.
+	const (
+		input = "Hello, world."
+		exp   = "2ae01472317d1935a84797ec1983ae243fc6aa28"
+	)
+	if _, err := hash.WriteString(input); err != nil {
+		t.Fatal(err)
+	}
+	b := make([]byte, 20)
+	if _, err := hash.Read(b); err != nil {
+		t.Fatal(err)
+	}
+	got := hex.EncodeToString(b)
+	if got != exp {
+		t.Fatalf("got: %q, want: %q", got, exp)
 	}
 }

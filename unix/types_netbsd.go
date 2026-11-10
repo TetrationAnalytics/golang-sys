@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build ignore
+//go:build ignore
 
 /*
 Input to cgo -godefs.  See README.md
@@ -40,6 +40,7 @@ package unix
 #include <sys/un.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
+#include <uvm/uvm_extern.h>
 #include <net/bpf.h>
 #include <net/if.h>
 #include <net/if_dl.h>
@@ -265,8 +266,10 @@ type Ptmget C.struct_ptmget
 
 const (
 	AT_FDCWD            = C.AT_FDCWD
-	AT_SYMLINK_FOLLOW   = C.AT_SYMLINK_FOLLOW
+	AT_EACCESS          = C.AT_EACCESS
 	AT_SYMLINK_NOFOLLOW = C.AT_SYMLINK_NOFOLLOW
+	AT_SYMLINK_FOLLOW   = C.AT_SYMLINK_FOLLOW
+	AT_REMOVEDIR        = C.AT_REMOVEDIR
 )
 
 // poll
@@ -293,6 +296,12 @@ type Sysctlnode C.struct_sysctlnode
 // Uname
 
 type Utsname C.struct_utsname
+
+// Uvmexp
+
+const SizeofUvmexp = C.sizeof_struct_uvmexp_sysctl
+
+type Uvmexp C.struct_uvmexp_sysctl
 
 // Clockinfo
 

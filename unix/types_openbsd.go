@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build ignore
+//go:build ignore
 
 /*
 Input to cgo -godefs.  See README.md
@@ -208,8 +208,6 @@ type RtMsghdr C.struct_rt_msghdr
 
 type RtMetrics C.struct_rt_metrics
 
-type Mclpool C.struct_mclpool
-
 // Berkeley packet filter
 
 const (
@@ -242,8 +240,10 @@ type Winsize C.struct_winsize
 
 const (
 	AT_FDCWD            = C.AT_FDCWD
-	AT_SYMLINK_FOLLOW   = C.AT_SYMLINK_FOLLOW
+	AT_EACCESS          = C.AT_EACCESS
 	AT_SYMLINK_NOFOLLOW = C.AT_SYMLINK_NOFOLLOW
+	AT_SYMLINK_FOLLOW   = C.AT_SYMLINK_FOLLOW
+	AT_REMOVEDIR        = C.AT_REMOVEDIR
 )
 
 // poll

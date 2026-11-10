@@ -2,18 +2,18 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build ignore
+//go:build ignore
 
 /*
 This program reads a file containing function prototypes
 (like syscall_darwin.go) and generates system call bodies.
 The prototypes are marked by lines beginning with "//sys"
 and read like func declarations if //sys is replaced by func, but:
-	* The parameter lists must give a name for each argument.
-	  This includes return parameters.
-	* The parameter lists must give a type for each argument:
-	  the (x, y, z int) shorthand is not allowed.
-	* If the return parameter is an error number, it must be named errno.
+  - The parameter lists must give a name for each argument.
+    This includes return parameters.
+  - The parameter lists must give a type for each argument:
+    the (x, y, z int) shorthand is not allowed.
+  - If the return parameter is an error number, it must be named errno.
 
 A line beginning with //sysnb is like //sys, except that the
 goroutine will not be suspended during the execution of the system
@@ -35,6 +35,7 @@ import (
 var (
 	b32       = flag.Bool("b32", false, "32bit big-endian")
 	l32       = flag.Bool("l32", false, "32bit little-endian")
+	libc      = flag.Bool("libc", false, "libc system calls")
 	plan9     = flag.Bool("plan9", false, "plan9")
 	openbsd   = flag.Bool("openbsd", false, "openbsd")
 	netbsd    = flag.Bool("netbsd", false, "netbsd")
@@ -42,6 +43,20 @@ var (
 	arm       = flag.Bool("arm", false, "arm") // 64-bit value should use (even, odd)-pair
 	tags      = flag.String("tags", "", "build tags")
 	filename  = flag.String("output", "", "output file name (standard output if omitted)")
+
+	libcPath = "libc.so"
+)
+
+var (
+	regexpComma          = regexp.MustCompile(`\s*,\s*`)
+	regexpParamKV        = regexp.MustCompile(`^(\S*) (\S*)$`)
+	regexpSys            = regexp.MustCompile(`^\/\/sys\t`)
+	regexpSysNonblock    = regexp.MustCompile(`^\/\/sysnb\t`)
+	regexpSysDeclaration = regexp.MustCompile(`^\/\/sys(nb)?\t(\w+)\(([^()]*)\)\s*(?:\(([^()]+)\))?\s*(?:=\s*((?i)SYS_[A-Z0-9_]+))?$`)
+	regexpPointer        = regexp.MustCompile(`^\*`)
+	regexpSlice          = regexp.MustCompile(`^\[](.*)`)
+	regexpDragonflyExtp  = regexp.MustCompile(`^(?i)extp(read|write)`)
+	regexpSyscallName    = regexp.MustCompile(`([a-z])([A-Z])`)
 )
 
 // cmdLine returns this programs's commandline arguments
@@ -49,9 +64,9 @@ func cmdLine() string {
 	return "go run mksyscall.go " + strings.Join(os.Args[1:], " ")
 }
 
-// buildTags returns build tags
-func buildTags() string {
-	return *tags
+// goBuildTags returns build tags in the go:build format.
+func goBuildTags() string {
+	return strings.ReplaceAll(*tags, ",", " && ")
 }
 
 // Param is function parameter
@@ -72,12 +87,12 @@ func parseParamList(list string) []string {
 	if list == "" {
 		return []string{}
 	}
-	return regexp.MustCompile(`\s*,\s*`).Split(list, -1)
+	return regexpComma.Split(list, -1)
 }
 
 // parseParam splits a parameter into name and type
 func parseParam(p string) Param {
-	ps := regexp.MustCompile(`^(\S*) (\S*)$`).FindStringSubmatch(p)
+	ps := regexpParamKV.FindStringSubmatch(p)
 	if ps == nil {
 		fmt.Fprintf(os.Stderr, "malformed parameter: %s\n", p)
 		os.Exit(1)
@@ -118,10 +133,11 @@ func main() {
 		endianness = "little-endian"
 	}
 
-	libc := false
 	if goos == "darwin" {
-		libc = true
+		libcPath = "/usr/lib/libSystem.B.dylib"
+		*libc = true
 	}
+
 	trampolines := map[string]bool{}
 
 	text := ""
@@ -134,17 +150,15 @@ func main() {
 		s := bufio.NewScanner(file)
 		for s.Scan() {
 			t := s.Text()
-			t = strings.TrimSpace(t)
-			t = regexp.MustCompile(`\s+`).ReplaceAllString(t, ` `)
-			nonblock := regexp.MustCompile(`^\/\/sysnb `).FindStringSubmatch(t)
-			if regexp.MustCompile(`^\/\/sys `).FindStringSubmatch(t) == nil && nonblock == nil {
+			nonblock := regexpSysNonblock.FindStringSubmatch(t)
+			if regexpSys.FindStringSubmatch(t) == nil && nonblock == nil {
 				continue
 			}
 
 			// Line must be of the form
 			//	func Open(path string, mode int, perm int) (fd int, errno error)
 			// Split into name, in params, out params.
-			f := regexp.MustCompile(`^\/\/sys(nb)? (\w+)\(([^()]*)\)\s*(?:\(([^()]+)\))?\s*(?:=\s*((?i)SYS_[A-Z0-9_]+))?$`).FindStringSubmatch(t)
+			f := regexpSysDeclaration.FindStringSubmatch(t)
 			if f == nil {
 				fmt.Fprintf(os.Stderr, "%s:%s\nmalformed //sys declaration\n", path, t)
 				os.Exit(1)
@@ -182,7 +196,7 @@ func main() {
 			n := 0
 			for _, param := range in {
 				p := parseParam(param)
-				if regexp.MustCompile(`^\*`).FindStringSubmatch(p.Type) != nil {
+				if regexpPointer.FindStringSubmatch(p.Type) != nil {
 					args = append(args, "uintptr(unsafe.Pointer("+p.Name+"))")
 				} else if p.Type == "string" && errvar != "" {
 					text += fmt.Sprintf("\tvar _p%d *byte\n", n)
@@ -196,7 +210,7 @@ func main() {
 					text += fmt.Sprintf("\t_p%d, _ = BytePtrFromString(%s)\n", n, p.Name)
 					args = append(args, fmt.Sprintf("uintptr(unsafe.Pointer(_p%d))", n))
 					n++
-				} else if regexp.MustCompile(`^\[\](.*)`).FindStringSubmatch(p.Type) != nil {
+				} else if regexpSlice.FindStringSubmatch(p.Type) != nil {
 					// Convert slice into pointer, length.
 					// Have to be careful not to take address of &a[0] if len == 0:
 					// pass dummy pointer in that case.
@@ -206,7 +220,7 @@ func main() {
 					text += fmt.Sprintf(" else {\n\t\t_p%d = unsafe.Pointer(&_zero)\n\t}\n", n)
 					args = append(args, fmt.Sprintf("uintptr(_p%d)", n), fmt.Sprintf("uintptr(len(%s))", p.Name))
 					n++
-				} else if p.Type == "int64" && (*openbsd || *netbsd) {
+				} else if p.Type == "int64" && ((*openbsd && !*libc) || *netbsd) {
 					args = append(args, "0")
 					if endianness == "big-endian" {
 						args = append(args, fmt.Sprintf("uintptr(%s>>32)", p.Name), fmt.Sprintf("uintptr(%s)", p.Name))
@@ -216,7 +230,7 @@ func main() {
 						args = append(args, fmt.Sprintf("uintptr(%s)", p.Name))
 					}
 				} else if p.Type == "int64" && *dragonfly {
-					if regexp.MustCompile(`^(?i)extp(read|write)`).FindStringSubmatch(funct) == nil {
+					if regexpDragonflyExtp.FindStringSubmatch(funct) == nil {
 						args = append(args, "0")
 					}
 					if endianness == "big-endian" {
@@ -276,17 +290,25 @@ func main() {
 			// System call number.
 			if sysname == "" {
 				sysname = "SYS_" + funct
-				sysname = regexp.MustCompile(`([a-z])([A-Z])`).ReplaceAllString(sysname, `${1}_$2`)
+				sysname = regexpSyscallName.ReplaceAllString(sysname, `${1}_$2`)
 				sysname = strings.ToUpper(sysname)
 			}
 
 			var libcFn string
-			if libc {
+			if *libc {
 				asm = "syscall_" + strings.ToLower(asm[:1]) + asm[1:] // internal syscall call
 				sysname = strings.TrimPrefix(sysname, "SYS_")         // remove SYS_
 				sysname = strings.ToLower(sysname)                    // lowercase
+				if *openbsd && *libc {
+					switch sysname {
+					case "__getcwd":
+						sysname = "getcwd"
+					case "__sysctl":
+						sysname = "sysctl"
+					}
+				}
 				libcFn = sysname
-				sysname = "funcPC(libc_" + sysname + "_trampoline)"
+				sysname = "libc_" + sysname + "_trampoline_addr"
 			}
 
 			// Actual call.
@@ -356,14 +378,14 @@ func main() {
 			text += "\treturn\n"
 			text += "}\n\n"
 
-			if libc && !trampolines[libcFn] {
-				// some system calls share a trampoline, like read and readlen.
+			if *libc && !trampolines[libcFn] {
+				// Some system calls share a trampoline.
 				trampolines[libcFn] = true
-				// Declare assembly trampoline.
-				text += fmt.Sprintf("func libc_%s_trampoline()\n", libcFn)
+				// Declare assembly trampoline address.
+				text += fmt.Sprintf("var libc_%s_trampoline_addr uintptr\n\n", libcFn)
 				// Assembly trampoline calls the libc_* function, which this magic
 				// redirects to use the function from libSystem.
-				text += fmt.Sprintf("//go:cgo_import_dynamic libc_%s %s \"/usr/lib/libSystem.B.dylib\"\n", libcFn, libcFn)
+				text += fmt.Sprintf("//go:cgo_import_dynamic libc_%s %s %q\n", libcFn, libcFn, libcPath)
 				text += "\n"
 			}
 		}
@@ -373,13 +395,13 @@ func main() {
 		}
 		file.Close()
 	}
-	fmt.Printf(srcTemplate, cmdLine(), buildTags(), text)
+	fmt.Printf(srcTemplate, cmdLine(), goBuildTags(), text)
 }
 
 const srcTemplate = `// %s
 // Code generated by the command above; see README.md. DO NOT EDIT.
 
-// +build %s
+//go:build %s
 
 package unix
 

@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// +build windows
+//go:build windows
 
 // Example service program that beeps.
 //
@@ -11,10 +11,10 @@
 // stop / start / pause / continue any service, and how to
 // write to event log. It also shows how to use debug
 // facilities available in debug package.
-//
 package main
 
 import (
+	"flag"
 	"fmt"
 	"log"
 	"os"
@@ -33,8 +33,11 @@ func usage(errmsg string) {
 	os.Exit(2)
 }
 
+var svcName = "exampleservice"
+
 func main() {
-	const svcName = "myservice"
+	flag.StringVar(&svcName, "name", svcName, "name of the service")
+	flag.Parse()
 
 	inService, err := svc.IsWindowsService()
 	if err != nil {
@@ -55,7 +58,7 @@ func main() {
 		runService(svcName, true)
 		return
 	case "install":
-		err = installService(svcName, "my service")
+		err = installService(svcName, "example service")
 	case "remove":
 		err = removeService(svcName)
 	case "start":

@@ -1,7 +1,7 @@
-FROM ubuntu:20.04
+FROM ubuntu:25.04
 
 # Disable interactive prompts on package installation
-ENV DEBIAN_FRONTEND noninteractive
+ENV DEBIAN_FRONTEND=noninteractive
 
 # Dependencies to get the git sources and go binaries
 RUN apt-get update && apt-get install -y  --no-install-recommends \
@@ -15,22 +15,22 @@ RUN apt-get update && apt-get install -y  --no-install-recommends \
 # Get the git sources. If not cached, this takes O(5 minutes).
 WORKDIR /git
 RUN git config --global advice.detachedHead false
-# Linux Kernel: Released 13 Dec 2020
-RUN git clone --branch v5.10 --depth 1 https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux
-# GNU C library: Released 06 Aug 2020 (we should try to get a secure way to clone this)
-RUN git clone --branch release/2.32/master --depth 1 git://sourceware.org/git/glibc.git
+# Linux Kernel: Released 16 Aug 2026
+RUN git clone --branch v7.2 --depth 1 https://kernel.googlesource.com/pub/scm/linux/kernel/git/torvalds/linux
+# GNU C library: Released 25 Jul 2026
+RUN git clone --branch release/2.44/master --depth 1 https://sourceware.org/git/glibc.git
 
 # Get Go
-ENV GOLANG_VERSION 1.16beta1
-ENV GOLANG_DOWNLOAD_URL https://golang.org/dl/go$GOLANG_VERSION.linux-amd64.tar.gz
-ENV GOLANG_DOWNLOAD_SHA256 3931a0d493d411d6c697df6f15d5292fdd8031fde7014fded399effdad4c12d8
+ENV GOLANG_VERSION=1.26.8
+ENV GOLANG_DOWNLOAD_URL=https://golang.org/dl/go$GOLANG_VERSION.linux-amd64.tar.gz
+ENV GOLANG_DOWNLOAD_SHA256=d0f743b33e8d8945e6b1f432edd15785c70507121d6e2a723b21285eddf8b57b
 
 RUN curl -fsSL "$GOLANG_DOWNLOAD_URL" -o golang.tar.gz \
     && echo "$GOLANG_DOWNLOAD_SHA256  golang.tar.gz" | sha256sum -c - \
     && tar -C /usr/local -xzf golang.tar.gz \
     && rm golang.tar.gz
 
-ENV PATH /usr/local/go/bin:$PATH
+ENV PATH=/usr/local/go/bin:$PATH
 
 # Linux and Glibc build dependencies and emulator
 RUN apt-get update && apt-get install -y  --no-install-recommends \
@@ -45,13 +45,14 @@ RUN apt-get update && apt-get install -y \
         gcc-aarch64-linux-gnu       gcc-arm-linux-gnueabi     \
         gcc-mips-linux-gnu          gcc-mips64-linux-gnuabi64 \
         gcc-mips64el-linux-gnuabi64 gcc-mipsel-linux-gnu      \
-        gcc-powerpc64-linux-gnu     gcc-powerpc64le-linux-gnu \
-	gcc-riscv64-linux-gnu                                 \
+        gcc-powerpc-linux-gnu       gcc-powerpc64-linux-gnu   \
+        gcc-powerpc64le-linux-gnu   gcc-riscv64-linux-gnu     \
         gcc-s390x-linux-gnu         gcc-sparc64-linux-gnu     \
+        gcc-loongarch64-linux-gnu \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 # Let the scripts know they are in the docker environment
-ENV GOLANG_SYS_BUILD docker
-WORKDIR /build
+ENV GOLANG_SYS_BUILD=docker
+WORKDIR /build/unix
 ENTRYPOINT ["go", "run", "linux/mkall.go", "/git/linux", "/git/glibc"]
